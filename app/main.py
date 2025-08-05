@@ -16,7 +16,7 @@ import re
 import asyncio
 import hashlib
 import time
-
+import uvicorn  # <-- Added this import
 
 # Load env vars and API key
 load_dotenv()
@@ -382,6 +382,5 @@ async def hackrx_run(req: HackRxRequest):
     return {"answers": final_answers}
 
 if __name__ == "__main__":
-    import uvicorn
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True)
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port)
