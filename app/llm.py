@@ -1,85 +1,91 @@
-# app/llm.py
 
-import os
-import json
-import google.generativeai as genai
-from dotenv import load_dotenv
-from app.prompts import MISTRAL_SYSTEM_PROMPT_TEMPLATE, build_mistral_prompt, build_batch_prompt
+from transformers import AutoTokenizer
+
+# Load tokenizer once globally
+tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+
+# 🔹 Template for single question prompt
+#prompts.py
+MISTRAL_SYSTEM_PROMPT_TEMPLATE = """
+You are a helpful insurance assistant. Your task is to read the given policy clauses and answer the user's question clearly and naturally, using only the information in the clauses.
+
+Instructions:
+- Start your answer with "Yes" or "No", based only on what's explicitly stated.
+- Use simple, natural language that anyone can understand.
+- Do NOT guess, assume, or include outside knowledge.
+- Do NOT mention clause numbers, section names, or formatting.
+- Be specific, complete, and keep the answer under 4 lines (ideally <25 words).
+- Include key details such as conditions, limits, waiting periods, or exclusions.
+
+Output format:
+{{
+  "answer": "<A full-sentence, clear answer starting with 'Yes' or 'No', using only clause content>"
+}}
+
+User Question:
+{query}
+
+Relevant Policy Clauses:
+{clauses}
+
+Respond with only the raw JSON (no markdown, no extra text, no backticks).
+""".strip()
 
 
-# Load Gemini API Key
-load_dotenv()
-api_key = os.getenv("GEMINI_API")
-genai.configure(api_key=api_key)
 
-# Use Gemini 1.5 Flash (Fast + Cheap)
-genai_model = genai.GenerativeModel("models/gemini-1.5-flash")
+# 🔹 Utility: Trim clauses by token limit
+def _trim_clauses(clauses: list, max_tokens: int) -> str:
+    trimmed = []
+    total_tokens = 0
 
-# Sanitize Gemini Output
-def _sanitize_llm_output(raw: str) -> str:
-    raw = raw.strip()
-    if raw.startswith("```json"):
-        raw = raw[7:]
-    elif raw.startswith("```"):
-        raw = raw[3:]
-    return raw.strip("`").strip()
+    for clause_obj in clauses:
+        clause = clause_obj.get("clause", "").strip()
+        tokens = len(tokenizer.tokenize(clause))
+        if total_tokens + tokens > max_tokens:
+            break
+        trimmed.append(clause)
+        total_tokens += tokens
 
-# Single-question prompt
-def query_mistral_with_clauses(question: str, clauses: list) -> dict:
-    prompt = build_mistral_prompt(question, clauses)
+    return "\n\n".join(trimmed)
 
-    try:
-        response = genai_model.generate_content(
-            contents=[{"role": "user", "parts": [prompt]}],
-            generation_config={
-                "temperature": 0.2,
-                "top_p": 0.7,
-                "max_output_tokens": 150
-            }
-        )
-        clean = _sanitize_llm_output(response.text)
-        return json.loads(clean)
 
-    except json.JSONDecodeError:
-        return {
-            "answer": "The document does not contain a clear or relevant clause to address this query.",
-            "supporting_clause": "None",
-            "explanation": "Gemini could not return valid JSON."
-        }
+# 🔹 Single-question prompt builder
+def build_mistral_prompt(query: str, clauses: list, max_tokens: int = 1500) -> str:
+    clause_text = _trim_clauses(clauses, max_tokens)
+    return MISTRAL_SYSTEM_PROMPT_TEMPLATE.format(
+        query=query.strip(),
+        clauses=clause_text
+    )
 
-    except Exception as e:
-        print(f"❌ LLM Error (single): {e}")
-        return {
-            "answer": "LLM processing error. Please try again.",
-            "supporting_clause": "None",
-            "explanation": str(e)
-        }
 
-# Batched multi-question prompt
-def query_mistral_batch(questions: list, clauses: list) -> dict:
-    prompt = build_batch_prompt(questions, clauses)
+# 🔹 Multi-question batch prompt builder
+def build_batch_prompt_with_context(questions: list, clause_map: dict, max_tokens: int = 1800) -> str:
+    clause_text = _trim_clauses(sum(clause_map.values(), []), max_tokens)
 
-    try:
-        response = genai_model.generate_content(
-            contents=[{"role": "user", "parts": [prompt]}],
-            generation_config={
-                "temperature": 0.2,
-                "top_p": 0.7,
-                "max_output_tokens": 300
-            }
-        )
-        clean = _sanitize_llm_output(response.text)
-        parsed = json.loads(clean)
+    question_block = "\n".join([
+        f"Q{i+1}: {q.strip()}\nContext: {clause_map.get(q, [{'clause': ''}])[0]['clause'][:250]}"
+        for i, q in enumerate(questions)
+    ])
 
-        # Ensure response matches expected format
-        if isinstance(parsed, dict) and all(k.startswith("Q") for k in parsed.keys()):
-            return parsed
-        else:
-            raise ValueError("Unexpected response format")
+    return f"""
+You are an expert insurance assistant. Read the policy clauses and answer each question strictly using only the clause content.
 
-    except json.JSONDecodeError:
-        return {f"Q{i+1}": "Invalid or incomplete answer." for i in range(len(questions))}
+Policy Clauses:
+{clause_text}
 
-    except Exception as e:
-        print(f"❌ LLM Error (batch): {e}")
-        return {f"Q{i+1}": "LLM processing error." for i in range(len(questions))}
+User Questions with Context:
+{question_block}
+
+Respond with answers in this JSON format:
+{{
+  "Q1": "answer to question 1",
+  "Q2": "answer to question 2",
+  ...
+}}
+
+Instructions:
+- Start with 'Yes' or 'No' when applicable.
+- Max 25 words per answer.
+- No assumptions or outside knowledge.
+- Respond ONLY with raw JSON.
+""".strip()
